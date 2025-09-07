@@ -4,7 +4,7 @@ import datetime
 import pandas as pd
 import streamlit as st
 from typing import Optional, Dict, Any
-from supabase import create_client, Client
+from supabase import create_client
 
 # =========================
 # Config & Setup
@@ -20,7 +20,56 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("Supabase credentials missing. Set SUPABASE_URL and SUPABASE_KEY in Streamlit Secrets.")
     st.stop()
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# new SDK: create_client returns the client instance
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# -------------------------
+# Helpers to handle responses
+# -------------------------
+def resp_data(resp):
+    """
+    Safely extract the `.data` payload from a response object or dict-like return.
+    Returns None if not present.
+    """
+    try:
+        # object with .data attribute
+        d = getattr(resp, "data", None)
+        if d is not None:
+            return d
+    except Exception:
+        pass
+    try:
+        # dict-like
+        if isinstance(resp, dict):
+            return resp.get("data") or resp.get("result") or resp.get("body")
+    except Exception:
+        pass
+    return None
+
+def resp_user(resp):
+    """
+    Safely extract the user object from auth responses.
+    """
+    try:
+        user = getattr(resp, "user", None)
+        if user:
+            return user
+    except Exception:
+        pass
+    d = resp_data(resp)
+    if isinstance(d, dict):
+        # new sdk might put user at d.get('user') or d.get('session',{}).get('user')
+        if "user" in d and d["user"]:
+            return d["user"]
+        session = d.get("session")
+        if isinstance(session, dict) and "user" in session:
+            return session["user"]
+    # dict-like root
+    if isinstance(resp, dict):
+        ud = resp.get("user")
+        if ud:
+            return ud
+    return None
 
 # =========================
 # Session state
@@ -42,16 +91,17 @@ def format_naira(amount: Optional[float]) -> str:
         return "₦0.00"
 
 def get_member_by_email(email: str) -> Optional[Dict[str, Any]]:
-    res = supabase.table("members").select("*").eq("email", email).limit(1).execute()
-    data = res.data or []
+    resp = supabase.table("members").select("*").eq("email", email).limit(1).execute()
+    data = resp_data(resp) or []
     return data[0] if data else None
 
 @st.cache_data(ttl=60)
 def get_members_map() -> Dict[str, Dict[str, str]]:
     """Map member_id -> info to avoid repeated queries."""
-    res = supabase.table("members").select("id,name,email,role").execute()
+    resp = supabase.table("members").select("id,name,email,role").execute()
+    rows = resp_data(resp) or []
     out = {}
-    for row in res.data or []:
+    for row in rows:
         out[row["id"]] = {
             "name": row.get("name") or "",
             "email": row.get("email") or "",
@@ -63,20 +113,32 @@ def is_admin(email: str) -> bool:
     m = get_member_by_email(email)
     return (m or {}).get("role") == "admin"
 
+# =========================
+# Auth: login / signup / logout
+# =========================
 def login(email: str, password: str) -> bool:
     try:
         resp = supabase.auth.sign_in_with_password({"email": email, "password": password})
-        if resp and resp.user and resp.user.email:
-            st.session_state.user_email = resp.user.email
-            st.session_state.user_id = getattr(resp.user, "id", None)
-            st.session_state.page = "Admin" if is_admin(resp.user.email) else "Member"
+        user = resp_user(resp)
+        if user:
+            # user may be dict-like or object with .email and .id
+            st.session_state.user_email = user.get("email") if isinstance(user, dict) else getattr(user, "email", None)
+            st.session_state.user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+            st.session_state.page = "Admin" if is_admin(st.session_state.user_email) else "Member"
             return True
+        else:
+            # If resp contains an 'error' field, show it
+            if isinstance(resp, dict) and resp.get("error"):
+                st.error(f"Login failed: {resp.get('error')}")
+            else:
+                st.error("Login failed: invalid credentials or no user returned.")
     except Exception as e:
         st.error(f"Login failed: {e}")
     return False
 
 def logout():
     try:
+        # new SDK sign_out
         supabase.auth.sign_out()
     except Exception:
         pass
@@ -86,7 +148,9 @@ def logout():
 
 def signup(name: str, email: str, password: str) -> bool:
     try:
-        supabase.auth.sign_up({"email": email, "password": password})
+        resp = supabase.auth.sign_up({"email": email, "password": password})
+        user = resp_user(resp)
+        # Create profile in members table regardless of immediate user object presence.
         supabase.table("members").insert({
             "name": name,
             "email": email,
@@ -118,9 +182,10 @@ def page_login():
         email = st.text_input("Email")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login")
-    if submitted and login(email, password):
-        st.success("Logged in successfully.")
-        st.experimental_rerun()
+    if submitted:
+        if login(email, password):
+            st.success("Logged in successfully.")
+            st.experimental_rerun()
 
 def page_register():
     st.title(f"Register – {COOP_NAME}")
@@ -129,10 +194,11 @@ def page_register():
         email = st.text_input("Email")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Create Account")
-    if submitted and signup(name, email, password):
-        st.success("Registration successful! Please log in.")
-        st.session_state.page = "Login"
-        st.experimental_rerun()
+    if submitted:
+        if signup(name, email, password):
+            st.success("Registration successful! Please log in.")
+            st.session_state.page = "Login"
+            st.experimental_rerun()
 
 def page_member_dashboard():
     member = get_member_required()
@@ -140,8 +206,8 @@ def page_member_dashboard():
     st.caption(f"Welcome, {member.get('name') or st.session_state.user_email}")
 
     col_a, col_b = st.columns(2)
-    col_a.metric("Savings Balance", format_naira(member["savings_balance"]))
-    col_b.metric("Loan Outstanding", format_naira(member["loan_balance"]))
+    col_a.metric("Savings Balance", format_naira(member.get("savings_balance", 0)))
+    col_b.metric("Loan Outstanding", format_naira(member.get("loan_balance", 0)))
 
     # Deposit/Withdraw
     st.subheader("Manage Savings")
@@ -150,58 +216,101 @@ def page_member_dashboard():
         amount = st.number_input("Amount (₦)", min_value=0.0, step=1000.0, format="%.2f")
         submitted = st.form_submit_button("Submit")
     if submitted:
-        if action == "Deposit":
-            new_balance = float(member["savings_balance"]) + float(amount)
-            supabase.table("members").update({"savings_balance": new_balance}).eq("id", member["id"]).execute()
-            supabase.table("savings_transactions").insert({
-                "member_id": member["id"], "transaction_type": "Deposit",
-                "amount": amount, "created_at": datetime.datetime.now().isoformat()
-            }).execute()
-            st.success(f"Deposited {format_naira(amount)}. New balance: {format_naira(new_balance)}")
-            st.experimental_rerun()
-        elif action == "Withdraw":
-            if float(amount) > float(member["savings_balance"]):
-                st.error("Insufficient savings balance.")
-            else:
-                new_balance = float(member["savings_balance"]) - float(amount)
+        if amount <= 0:
+            st.error("Amount must be greater than zero.")
+        else:
+            if action == "Deposit":
+                new_balance = float(member.get("savings_balance", 0)) + float(amount)
                 supabase.table("members").update({"savings_balance": new_balance}).eq("id", member["id"]).execute()
                 supabase.table("savings_transactions").insert({
-                    "member_id": member["id"], "transaction_type": "Withdraw",
-                    "amount": amount, "created_at": datetime.datetime.now().isoformat()
+                    "member_id": member["id"],
+                    "transaction_type": "Deposit",
+                    "amount": amount,
+                    "created_at": datetime.datetime.now().isoformat()
                 }).execute()
-                st.success(f"Withdrew {format_naira(amount)}. New balance: {format_naira(new_balance)}")
+                st.success(f"Deposited {format_naira(amount)}. New balance: {format_naira(new_balance)}")
                 st.experimental_rerun()
+            else:  # Withdraw
+                if float(amount) > float(member.get("savings_balance", 0)):
+                    st.error("Insufficient savings balance.")
+                else:
+                    new_balance = float(member.get("savings_balance", 0)) - float(amount)
+                    supabase.table("members").update({"savings_balance": new_balance}).eq("id", member["id"]).execute()
+                    supabase.table("savings_transactions").insert({
+                        "member_id": member["id"],
+                        "transaction_type": "Withdraw",
+                        "amount": amount,
+                        "created_at": datetime.datetime.now().isoformat()
+                    }).execute()
+                    st.success(f"Withdrew {format_naira(amount)}. New balance: {format_naira(new_balance)}")
+                    st.experimental_rerun()
+
+    st.divider()
 
     # Loan application
     st.subheader("Apply for Loan")
     with st.form("loan_apply_form", clear_on_submit=True):
         loan_amount = st.number_input("Loan Amount (₦)", min_value=0.0, step=10000.0, format="%.2f")
         submit_loan = st.form_submit_button("Submit Application")
-    if submit_loan and loan_amount > 0:
-        insert = supabase.table("loan_applications").insert({
-            "member_id": member["id"], "amount": loan_amount,
-            "status": "Pending", "created_at": datetime.datetime.now().isoformat()
-        }).execute()
-        loan_row = (insert.data or [None])[0]
-        supabase.table("loan_transactions").insert({
-            "member_id": member["id"],
-            "loan_application_id": loan_row["id"] if loan_row else None,
-            "action": "Applied", "amount": loan_amount,
-            "created_at": datetime.datetime.now().isoformat()
-        }).execute()
-        st.success("Loan application submitted.")
-        st.experimental_rerun()
+    if submit_loan:
+        if loan_amount <= 0:
+            st.error("Loan amount must be greater than zero.")
+        else:
+            insert_resp = supabase.table("loan_applications").insert({
+                "member_id": member["id"],
+                "amount": loan_amount,
+                "status": "Pending",
+                "created_at": datetime.datetime.now().isoformat()
+            }).execute()
+            insert_data = resp_data(insert_resp) or []
+            loan_row = insert_data[0] if insert_data else None
+            supabase.table("loan_transactions").insert({
+                "member_id": member["id"],
+                "loan_application_id": loan_row.get("id") if loan_row else None,
+                "action": "Applied",
+                "amount": loan_amount,
+                "created_at": datetime.datetime.now().isoformat()
+            }).execute()
+            st.success("Loan application submitted.")
+            st.experimental_rerun()
+
+    st.divider()
 
     # Savings history
     st.subheader("Savings Transactions History")
-    logs = supabase.table("savings_transactions").select("*").eq("member_id", member["id"]).order("created_at", desc=True).execute().data or []
+    logs_resp = supabase.table("savings_transactions").select("*").eq("member_id", member["id"]).order("created_at", desc=True).execute()
+    logs = resp_data(logs_resp) or []
     if logs:
-        df = pd.DataFrame(logs)[["created_at", "transaction_type", "amount"]]
+        df = pd.DataFrame(logs)
+        # Ensure columns exist safely
+        df["amount"] = df["amount"].astype(float)
+        df = df[["created_at", "transaction_type", "amount"]]
         df.rename(columns={"created_at": "Date", "transaction_type": "Type", "amount": "Amount (₦)"}, inplace=True)
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         st.info("No savings transactions yet.")
 
+    # Loan history
+    st.subheader("Loan Transactions History")
+    loan_logs_resp = supabase.table("loan_transactions").select("*").eq("member_id", member["id"]).order("created_at", desc=True).execute()
+    loan_logs = resp_data(loan_logs_resp) or []
+    if loan_logs:
+        df_loan = pd.DataFrame(loan_logs)
+        df_loan["amount"] = df_loan["amount"].astype(float)
+        df_loan = df_loan[["created_at", "action", "amount", "loan_application_id"]]
+        df_loan.rename(columns={
+            "created_at": "Date",
+            "action": "Action",
+            "amount": "Amount (₦)",
+            "loan_application_id": "Application ID"
+        }, inplace=True)
+        st.dataframe(df_loan, use_container_width=True, hide_index=True)
+    else:
+        st.info("No loan transactions yet.")
+
+# =========================
+# Admin Dashboard
+# =========================
 def page_admin_dashboard():
     if not is_admin(st.session_state.user_email):
         st.error("Admin access only.")
@@ -212,40 +321,105 @@ def page_admin_dashboard():
 
     tab1, tab2, tab3 = st.tabs(["Loan Applications", "All Savings Transactions", "All Loan Transactions"])
 
+    # ---- Loan Applications ----
     with tab1:
-        apps = supabase.table("loan_applications").select("*").order("created_at", desc=True).execute().data or []
+        apps_resp = supabase.table("loan_applications").select("*").order("created_at", desc=True).execute()
+        apps = resp_data(apps_resp) or []
         if not apps:
             st.info("No loan applications found.")
         else:
             for app in apps:
-                member_info = members_map.get(app["member_id"], {})
-                m_name, m_email = member_info.get("name", ""), member_info.get("email", "")
-                with st.container(border=True):
-                    st.write(
-                        f"**Loan #{app['id']}** — {m_name} ({m_email}) | "
-                        f"Amount: {format_naira(app['amount'])} | "
-                        f"Status: **{app['status']}** | Date: {app['created_at']}"
-                    )
-                    if app["status"] == "Pending":
-                        if st.button(f"✅ Approve #{app['id']}", key=f"approve_{app['id']}"):
-                            supabase.table("loan_applications").update({"status": "Approved"}).eq("id", app["id"]).execute()
-                            member_row = supabase.table("members").select("*").eq("id", app["member_id"]).execute().data[0]
-                            new_balance = float(member_row["loan_balance"]) + float(app["amount"])
-                            supabase.table("members").update({"loan_balance": new_balance}).eq("id", member_row["id"]).execute()
+                member_info = members_map.get(app.get("member_id"), {})
+                m_name = member_info.get("name") or "Unknown"
+                m_email = member_info.get("email") or "unknown@example.com"
+
+                # Use container (border support may vary by Streamlit version)
+                st.write("---")
+                st.write(
+                    f"**Loan #{app.get('id')}** — {m_name} ({m_email}) | "
+                    f"Amount: {format_naira(app.get('amount'))} | "
+                    f"Status: **{app.get('status')}** | Date: {app.get('created_at')}"
+                )
+                if app.get("status") == "Pending":
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button(f"✅ Approve #{app.get('id')}", key=f"approve_{app.get('id')}"):
+                            supabase.table("loan_applications").update({"status": "Approved"}).eq("id", app.get("id")).execute()
+                            member_row_resp = supabase.table("members").select("*").eq("id", app.get("member_id")).execute()
+                            member_row_data = resp_data(member_row_resp) or []
+                            if member_row_data:
+                                member_row = member_row_data[0]
+                                new_balance = float(member_row.get("loan_balance", 0)) + float(app.get("amount", 0))
+                                supabase.table("members").update({"loan_balance": new_balance}).eq("id", member_row.get("id")).execute()
+                                supabase.table("loan_transactions").insert({
+                                    "member_id": member_row.get("id"),
+                                    "loan_application_id": app.get("id"),
+                                    "action": "Approved",
+                                    "amount": app.get("amount"),
+                                    "created_at": datetime.datetime.now().isoformat()
+                                }).execute()
+                                st.success("Approved and updated member's loan balance.")
+                                st.experimental_rerun()
+                            else:
+                                st.error("Member record not found when approving.")
+                    with c2:
+                        if st.button(f"⛔ Reject #{app.get('id')}", key=f"reject_{app.get('id')}"):
+                            supabase.table("loan_applications").update({"status": "Rejected"}).eq("id", app.get("id")).execute()
                             supabase.table("loan_transactions").insert({
-                                "member_id": member_row["id"], "loan_application_id": app["id"],
-                                "action": "Approved", "amount": app["amount"], "created_at": datetime.datetime.now().isoformat()
-                            }).execute()
-                            st.success("Approved and updated member's loan balance.")
-                            st.experimental_rerun()
-                        if st.button(f"⛔ Reject #{app['id']}", key=f"reject_{app['id']}"):
-                            supabase.table("loan_applications").update({"status": "Rejected"}).eq("id", app["id"]).execute()
-                            supabase.table("loan_transactions").insert({
-                                "member_id": app["member_id"], "loan_application_id": app["id"],
-                                "action": "Rejected", "amount": app["amount"], "created_at": datetime.datetime.now().isoformat()
+                                "member_id": app.get("member_id"),
+                                "loan_application_id": app.get("id"),
+                                "action": "Rejected",
+                                "amount": app.get("amount"),
+                                "created_at": datetime.datetime.now().isoformat()
                             }).execute()
                             st.warning("Rejected application.")
                             st.experimental_rerun()
+
+    # ---- All Savings Transactions ----
+    with tab2:
+        sav_resp = supabase.table("savings_transactions").select("*").order("created_at", desc=True).execute()
+        sav_logs = resp_data(sav_resp) or []
+        if sav_logs:
+            enriched = []
+            members_map_local = members_map  # small alias
+            for row in sav_logs:
+                m = members_map_local.get(row.get("member_id"), {})
+                enriched.append({
+                    "Date": row.get("created_at"),
+                    "Member": m.get("name") or "",
+                    "Email": m.get("email") or "",
+                    "Type": row.get("transaction_type"),
+                    "Amount (₦)": float(row.get("amount", 0)),
+                })
+            df = pd.DataFrame(enriched)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Savings CSV", csv, file_name="savings_transactions.csv", mime="text/csv")
+        else:
+            st.info("No savings transactions found.")
+
+    # ---- All Loan Transactions ----
+    with tab3:
+        loan_resp = supabase.table("loan_transactions").select("*").order("created_at", desc=True).execute()
+        loan_logs = resp_data(loan_resp) or []
+        if loan_logs:
+            enriched = []
+            for row in loan_logs:
+                m = members_map.get(row.get("member_id"), {})
+                enriched.append({
+                    "Date": row.get("created_at"),
+                    "Member": m.get("name") or "",
+                    "Email": m.get("email") or "",
+                    "Action": row.get("action"),
+                    "Amount (₦)": float(row.get("amount", 0)),
+                    "Application ID": row.get("loan_application_id"),
+                })
+            df = pd.DataFrame(enriched)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Loans CSV", csv, file_name="loan_transactions.csv", mime="text/csv")
+        else:
+            st.info("No loan transactions found.")
 
 # =========================
 # Sidebar Navigation
