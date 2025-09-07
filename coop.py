@@ -1,9 +1,9 @@
-# app.py
+# coop.py
 import os
 import datetime
 import pandas as pd
 import streamlit as st
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from supabase import create_client, Client
 
 # =========================
