@@ -14,14 +14,17 @@ st.set_page_config(
     page_icon="🏦",
     layout="wide"
 )
+
 COOP_NAME = "NAAT Multipurpose Cooperative JOSTUM"
 
-# Read Supabase credentials from Streamlit secrets or environment
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("❌ Supabase credentials missing. Please set SUPABASE_URL and SUPABASE_KEY in Streamlit Secrets.")
+# -------------------------
+# Supabase Credentials
+# -------------------------
+try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+except Exception:
+    st.error("❌ Supabase credentials missing. Please add SUPABASE_URL and SUPABASE_KEY to your Streamlit Cloud secrets.")
     st.stop()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
